@@ -1,3 +1,4 @@
+#include "../common/protocol.h"
 #include<bits/stdc++.h>
 #include <cstdio>
 #include <cstring>
@@ -45,18 +46,16 @@ int main(int argc, char* argv[]){
         return 1;
     }
     printf("Client connected.\n");
-    char buf[1024] = {0};
-    ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
-        printf("Client disconnected or error.\n");
+
+    string payload;
+    if(!recv_message(client_fd,payload)){
+        printf("Client disconnected or error .\n");
         close(client_fd);
         close(listen_fd);
         return 1;
     }
-    buf[n] = '\0';
-    printf("Received: %s\n", buf);
-    const char* response = "HELLO_ACK";
-    send(client_fd, response, strlen(response), 0);
+    printf("Received: %s\n", payload.c_str());
+    send_message(client_fd, "HELLO_ACK");
      close(client_fd);
     close(listen_fd);
     return 0;

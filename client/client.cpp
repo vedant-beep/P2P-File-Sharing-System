@@ -1,3 +1,5 @@
+#include "../common/protocol.h"
+#include<bits/stdc++.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -5,6 +7,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+using namespace std;
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -33,16 +37,15 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Connected to tracker at %s:%d\n", ip, port);
-    const char* msg = "HELLO";
-    send(sock_fd, msg, strlen(msg), 0);
-    printf("Sent: %s\n", msg);
-    char buf[1024] = {0};
-    ssize_t n = recv(sock_fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
-        printf("No response / connection closed.\n");
-    } else {
-        buf[n] = '\0';
-        printf("Received: %s\n", buf);
+    send_message(sock_fd, "HELLO");
+    printf("Sent: HELLO\n");
+
+    string response;
+    if(recv_message(sock_fd,response)){
+        printf("Received: %s\n",response.c_str());
+    }
+    else{
+        printf("No response/ connection closed.\n");
     }
 
     close(sock_fd);
