@@ -22,24 +22,55 @@ struct User{
 
 map<string,User>users;
 map<string,Group>groups;
+string current_user = "";
+
+void do_logout(string& current_user){
+    if(!current_user.empty()){
+        users[current_user].logged_in = false;
+        current_user = "";
+    }
+}
+
+string handle_command(const string &line,string& current_user){
+    istringstream iss(line);
+    string tok1,tok2;
+    iss>>tok1>>tok2;
+    if(tok1 == "create" && tok2 == "user"){
+        string username,password;
+        iss>>username>>password;
+        if(username.empty() || password.empty()){
+            return "ERROR missing arguments";
+        }
+        if(users.count(username)){
+            return "ERROR user already exists";
+        }
+        users[username] = {password,false};
+        return "SUCCESS user created";
+    }
+
+    if(tok1 == "login"){
+        string username = tok2,password;
+        iss>>password;
+        if(username.empty() || password.empty()) return "ERROR missing arguments";
+        auto it = users.find(username);
+        if(it == users.end()) return "ERROR user not found";
+        if(it->second.password != password) return "ERROR wrong password";
+        if(it->second.logged_in) return "ERROR already logged in";
+        it->second.logged_in = true;
+        current_user = username;
+        return "SUCCESS logged in";
+    }
+
+    if(tok1 == "logout"){
+        if(current_user.empty()) return "ERROR not logged in";
+        do_logout(current_user);
+        return "SUCCESS logged out";
+    }
+    return "ERROR unknown command";
+}
+
 
 int main(int argc, char* argv[]){
-    // TEMPORARY — delete before Phase 4
-    users["alice"] = {"password123", false};
-    groups["G1"] = {"alice", {"alice"}, {}};
-    groups["G1"].pending.insert("bob");
-
-    printf("User alice exists: %d\n", users.count("alice") > 0);
-    printf("Group G1 owner: %s\n", groups["G1"].owner.c_str());
-    printf("Group G1 member count: %zu\n", groups["G1"].members.size());
-    printf("Is bob pending in G1: %d\n", groups["G1"].pending.count("bob") > 0);
-
-    groups["G1"].pending.erase("bob");
-    groups["G1"].members.insert("bob");
-    printf("After accept — bob is member: %d, bob is pending: %d\n",
-        groups["G1"].members.count("bob") > 0,
-        groups["G1"].pending.count("bob") > 0);
-return 0; // stop here for this test, before the real socket code runs
      if (argc<3) {
         fprintf(stderr, "Usage: %s tracker_info.txt tracker_no\n", argv[0]);
         return 1;
@@ -67,25 +98,36 @@ return 0; // stop here for this test, before the real socket code runs
         return 1;
     }
     printf("Tracker is listening on port %d...\n",port);
-    sockaddr_in client_addr{};
-    socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(listen_fd, (sockaddr*)&client_addr, &client_len);
-    if (client_fd < 0) {
-        perror("accept failed");
-        return 1;
-    }
-    printf("Client connected.\n");
 
-    string payload;
-    if(!recv_message(client_fd,payload)){
-        printf("Client disconnected or error .\n");
+    while(true){
+        sockaddr_in client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(listen_fd, (sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) {
+            perror("accept failed");
+            continue;
+        }
+        printf("Client connected.\n");
+
+        while(true){
+            string payload;
+            if(!recv_message(client_fd,payload)){
+                printf("Client disconnected or error .\n");
+                do_logout(current_user);
+                break;
+            }
+            printf("Received: %s\n", payload.c_str());
+            string response = handle_command(payload,current_user);
+            printf("Responding %s\n",response.c_str());
+            
+            if(!send_message(client_fd,response)){
+                printf("Failed to see the response\n");
+                do_logout(current_user);
+                break;
+            }
+        }
         close(client_fd);
-        close(listen_fd);
-        return 1;
     }
-    printf("Received: %s\n", payload.c_str());
-    send_message(client_fd, "HELLO_ACK");
-     close(client_fd);
     close(listen_fd);
     return 0;
 }

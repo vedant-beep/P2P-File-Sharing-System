@@ -37,17 +37,22 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Connected to tracker at %s:%d\n", ip, port);
-    send_message(sock_fd, "HELLO");
-    printf("Sent: HELLO\n");
-
-    string response;
-    if(recv_message(sock_fd,response)){
-        printf("Received: %s\n",response.c_str());
+    printf("Type commands (Ctrl+D to quit):\n");
+    
+    string line;
+    while(getline(cin,line)){
+        if(line.empty()) continue;
+        if (!send_message(sock_fd, line)) {
+            printf("Connection lost.\n");
+            break;
+        }
+        string response;
+        if (!recv_message(sock_fd, response)) {
+            printf("Connection lost.\n");
+            break;
+        }
+        printf("%s\n",response.c_str());
     }
-    else{
-        printf("No response/ connection closed.\n");
-    }
-
     close(sock_fd);
     return 0;
 }
