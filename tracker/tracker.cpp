@@ -9,8 +9,37 @@
 #include <arpa/inet.h>
 using namespace std;
 
+struct Group{
+    string owner;
+    set<string>members;
+    set<string>pending;
+};
+
+struct User{
+    string password;
+    bool logged_in = false;
+};
+
+map<string,User>users;
+map<string,Group>groups;
 
 int main(int argc, char* argv[]){
+    // TEMPORARY — delete before Phase 4
+    users["alice"] = {"password123", false};
+    groups["G1"] = {"alice", {"alice"}, {}};
+    groups["G1"].pending.insert("bob");
+
+    printf("User alice exists: %d\n", users.count("alice") > 0);
+    printf("Group G1 owner: %s\n", groups["G1"].owner.c_str());
+    printf("Group G1 member count: %zu\n", groups["G1"].members.size());
+    printf("Is bob pending in G1: %d\n", groups["G1"].pending.count("bob") > 0);
+
+    groups["G1"].pending.erase("bob");
+    groups["G1"].members.insert("bob");
+    printf("After accept — bob is member: %d, bob is pending: %d\n",
+        groups["G1"].members.count("bob") > 0,
+        groups["G1"].pending.count("bob") > 0);
+return 0; // stop here for this test, before the real socket code runs
      if (argc<3) {
         fprintf(stderr, "Usage: %s tracker_info.txt tracker_no\n", argv[0]);
         return 1;
