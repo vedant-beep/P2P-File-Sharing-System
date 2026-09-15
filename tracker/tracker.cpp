@@ -66,6 +66,21 @@ string handle_command(const string &line,string& current_user){
         do_logout(current_user);
         return "SUCCESS logged out";
     }
+
+    if(tok1 == "create" && tok2 == "group"){
+        if(current_user.empty() ) return "ERROR not logged in";
+
+        string group_id;
+        iss>>group_id;
+
+        if(group_id.empty()) return "ERROR missing arguments";
+        if (groups.count(group_id)) return "ERROR group_already_exists";
+        Group g;
+        g.owner = current_user;
+        g.members.insert(current_user);
+        groups[group_id] = g;
+        return "SUCCESS group_created";
+    }
     return "ERROR unknown command";
 }
 
