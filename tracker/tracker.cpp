@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fstream>
 using namespace std;
 
 struct Group {
@@ -18,6 +19,11 @@ struct Group {
 struct User {
     string password;
     bool logged_in = false;
+};
+
+struct TrackerAddr {
+    string ip;
+    int port;
 };
 
 map<string, User> users;
@@ -200,12 +206,42 @@ string handle_command(const string& line, string& current_user) {
     return "ERROR unknown_command";
 }
 
+vector<TrackerAddr> read_tracker_info(const string& path) {
+    ifstream file(path);
+    if (!file.is_open()) {
+        fprintf(stderr, "Could not open %s\n", path.c_str());
+        exit(1);
+    }
+
+    vector<TrackerAddr> addrs;
+    string ip;
+    int port;
+    while (file >> ip >> port) {
+        addrs.push_back({ip, port});
+    }
+
+    if (addrs.size() < 2) {
+        fprintf(stderr, "tracker_info.txt must have at least 2 tracker entries\n");
+        exit(1);
+    }
+    return addrs;
+}
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s tracker_info.txt tracker_no\n", argv[0]);
         return 1;
     }
-    int port = (atoi(argv[2]) == 1) ? 5000 : 5001;
+    string info_path = argv[1];
+    int tracker_no = atoi(argv[2]);   // 1 or 2
+
+    vector<TrackerAddr> addrs = read_tracker_info(info_path);
+    if (tracker_no < 1 || tracker_no > (int)addrs.size()) {
+        fprintf(stderr, "tracker_no must be between 1 and %zu\n", addrs.size());
+        return 1;
+    }
+    TrackerAddr self = addrs[tracker_no - 1];
+    int port = self.port;
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("Socket failed");
@@ -226,7 +262,7 @@ int main(int argc, char* argv[]) {
         perror("listen failed");
         return 1;
     }
-    printf("Tracker is listening on port %d...\n", port);
+    printf("Tracker %d listening on %s:%d...\n", tracker_no, self.ip.c_str(), port);
 
     while (true) {
         sockaddr_in client_addr{};
@@ -237,7 +273,7 @@ int main(int argc, char* argv[]) {
             continue;
         }
         printf("Client connected.\n");
-        string current_user = "";  // fresh per-connection state, per client
+        string current_user = "";
 
         while (true) {
             string payload;
