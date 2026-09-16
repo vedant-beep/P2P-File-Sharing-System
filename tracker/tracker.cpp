@@ -8,7 +8,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fstream>
+#include <thread>
+#include <chrono>
+#include <mutex>
 using namespace std;
+
+int g_sync_fd = -1;
 
 struct Group {
     string owner;
@@ -28,6 +33,7 @@ struct TrackerAddr {
 
 map<string, User> users;
 map<string, Group> groups;
+mutex g_state_mutex;
 string missing_args = "ERROR missing_arguments";
 
 void do_logout(string& current_user) {
@@ -53,7 +59,18 @@ string check_is_owner(const Group& g, const string& current_user) {
     return "";
 }
 
+void forward_sync_op(const string& op_line) {
+    if (g_sync_fd < 0) {
+        printf("[sync] no peer connected, skipping forward: %s\n", op_line.c_str());
+        return;
+    }
+    if (!send_message(g_sync_fd, op_line)) {
+        printf("[sync] forward failed (peer likely down): %s\n", op_line.c_str());
+    }
+}
+
 string handle_command(const string& line, string& current_user) {
+    lock_guard<mutex> lock(g_state_mutex);
     istringstream iss(line);
     string tok1, tok2;
     iss >> tok1 >> tok2;
@@ -64,6 +81,7 @@ string handle_command(const string& line, string& current_user) {
         if (username.empty() || password.empty()) return missing_args;
         if (users.count(username)) return "ERROR user_already_exists";
         users[username] = {password, false};
+        forward_sync_op("SYNC_OP CREATE_USER " + username + " " + password);
         return "SUCCESS user_created";
     }
 
@@ -206,6 +224,97 @@ string handle_command(const string& line, string& current_user) {
     return "ERROR unknown_command";
 }
 
+void apply_sync_op(const string& op_line) {
+    istringstream iss(op_line);
+    string tag, opname;
+    iss >> tag >> opname;   // tag == "SYNC_OP"
+
+    if (opname == "CREATE_USER") {
+        string username, password;
+        iss >> username >> password;
+        if (username.empty() || password.empty()) {
+            printf("[sync] malformed CREATE_USER op, ignoring\n");
+            return;
+        }
+
+        lock_guard<mutex> lock(g_state_mutex);
+        if (users.count(username)) {
+            printf("[sync] user '%s' already exists locally, skipping\n", username.c_str());
+            return;
+        }
+        users[username] = {password, false};
+        printf("[sync] applied CREATE_USER %s\n", username.c_str());
+        return;
+    }
+
+    printf("[sync] unknown sync op: %s\n", opname.c_str());
+}
+
+
+void sync_thread_func(int tracker_no, TrackerAddr self, TrackerAddr peer) {
+    int sync_fd = -1;
+
+    if (tracker_no == 1) {
+        int sync_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        int opt = 1;
+        setsockopt(sync_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(self.port + 100);
+
+        bind(sync_listen_fd, (sockaddr*)&addr, sizeof(addr));
+        listen(sync_listen_fd, 1);
+        printf("[sync] Waiting for peer tracker to connect on port %d...\n", self.port + 100);
+
+        sockaddr_in peer_addr{};
+        socklen_t peer_len = sizeof(peer_addr);
+        sync_fd = accept(sync_listen_fd, (sockaddr*)&peer_addr, &peer_len);
+        printf("[sync] Peer tracker connected.\n");
+
+    } else {
+        while (true) {
+            sync_fd = socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(peer.port + 100);
+            inet_pton(AF_INET, peer.ip.c_str(), &addr.sin_addr);
+            if (connect(sync_fd, (sockaddr*)&addr, sizeof(addr)) == 0) {
+                printf("[sync] Connected to peer tracker.\n");
+                break;
+            }
+            close(sync_fd);
+            printf("[sync] Peer tracker not up yet, retrying...\n");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    g_sync_fd = sync_fd;
+    if (tracker_no == 1) {
+        string msg;
+        recv_message(sync_fd, msg);
+        printf("[sync] Received: %s\n", msg.c_str());
+        send_message(sync_fd, "SYNC_ACK");
+    } else {
+        send_message(sync_fd, "SYNC_HELLO");
+        std::string reply;
+        recv_message(sync_fd, reply);
+        printf("[sync] Received: %s\n", reply.c_str());
+    }
+    while (true) {
+        string msg;
+        if (!recv_message(sync_fd, msg)) {
+            printf("[sync] Peer tracker disconnected.\n");
+            break;
+        }
+        printf("[sync] Received: %s\n", msg.c_str());
+        if (msg.rfind("SYNC_OP", 0) == 0) {
+            apply_sync_op(msg);
+        }
+    }
+}
+
 vector<TrackerAddr> read_tracker_info(const string& path) {
     ifstream file(path);
     if (!file.is_open()) {
@@ -240,6 +349,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     TrackerAddr self = addrs[tracker_no - 1];
+    TrackerAddr peer = addrs[tracker_no == 1 ? 1 : 0];
+    thread sync_thread(sync_thread_func, tracker_no, self, peer);
+    sync_thread.detach();
     int port = self.port;
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
