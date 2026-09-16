@@ -20,6 +20,7 @@ struct Group {
     string owner;
     set<string> members;
     set<string> pending;
+    vector<string> join_order;
 };
 
 struct User {
@@ -108,6 +109,7 @@ void raw_create_group(const string& group_id, const string& owner) {
     Group g;
     g.owner = owner;
     g.members.insert(owner);
+    g.join_order.push_back(owner);
     groups[group_id] = g;
 }
 
@@ -119,10 +121,21 @@ void raw_accept_request(const string& group_id, const string& username) {
     Group& g = groups[group_id];
     g.pending.erase(username);
     g.members.insert(username);
+    g.join_order.push_back(username);
 }
 
-void raw_leave_group(const string& group_id, const string& username) {
-    groups[group_id].members.erase(username);
+void raw_leave_group(const string& group_id, const string& username,const string& new_owner) {
+    Group& g = groups[group_id];
+    g.members.erase(username);
+    g.join_order.erase(remove(g.join_order.begin(), g.join_order.end(), username), g.join_order.end());
+    g.owner = new_owner;
+}
+
+void raw_join_as_owner(const string& group_id, const string& username) {
+    Group& g = groups[group_id];
+    g.members.insert(username);
+    g.join_order.push_back(username);
+    g.owner = username;
 }
 
 string handle_command(const string& line, string& current_user) {
@@ -191,6 +204,11 @@ string handle_command(const string& line, string& current_user) {
         Group& g = it->second;
         if (g.members.count(current_user)) return "ERROR already_member";
         if (g.pending.count(current_user)) return "ERROR already_pending";
+        if (g.owner.empty()) {
+            raw_join_as_owner(group_id, current_user);
+            forward_sync_op("JOIN_AS_OWNER " + group_id + " " + current_user);
+            return "SUCCESS joined_as_owner";
+        }
         raw_join_group(group_id, current_user);
         forward_sync_op("JOIN_GROUP " + group_id + " " + current_user);
         return "SUCCESS join_requested";
@@ -271,10 +289,19 @@ string handle_command(const string& line, string& current_user) {
 
         Group& g = it->second;
         if (!g.members.count(current_user)) return "ERROR not_a_member";
-        if (current_user == g.owner) return "ERROR owner_cannot_leave";
-        raw_leave_group(group_id, current_user);
-        forward_sync_op("LEAVE_GROUP " + group_id + " " + current_user);
-        return "SUCCESS left_group";
+        string new_owner = g.owner;
+        bool was_owner = (current_user == g.owner);
+        if (was_owner) {
+            new_owner = "";
+            for (const string& candidate : g.join_order) {
+                if (candidate != current_user) { new_owner = candidate; break; }
+            }
+        }
+        raw_leave_group(group_id, current_user,new_owner);
+        forward_sync_op("LEAVE_GROUP " + group_id + " " + current_user + " " + (new_owner.empty() ? "NONE" : new_owner));
+        if (!was_owner) return "SUCCESS left_group";
+        if (new_owner.empty()) return "SUCCESS left_group group_ownerless";
+        return "SUCCESS left_group new_owner_" + new_owner;
     }
 
     return "ERROR unknown_command";
@@ -393,8 +420,8 @@ void apply_sync_op(const string& op_line) {
     }
 
     if (opname == "LEAVE_GROUP") {
-        string group_id, username;
-        iss >> group_id >> username;
+        string group_id, username, new_owner_token;
+        iss >> group_id >> username >> new_owner_token;
         if (group_id.empty() || username.empty()) {
             printf("[sync] malformed LEAVE_GROUP op, ignoring\n");
             return;
@@ -404,8 +431,25 @@ void apply_sync_op(const string& op_line) {
             printf("[sync] LEAVE_GROUP for unknown group '%s', ignoring\n", group_id.c_str());
             return;
         }
-        raw_leave_group(group_id, username);
-        printf("[sync] applied LEAVE_GROUP %s %s\n", group_id.c_str(), username.c_str());
+        string new_owner = (new_owner_token == "NONE") ? "" : new_owner_token;
+        raw_leave_group(group_id, username, new_owner);
+        printf("[sync] applied %s LEAVE_GROUP %s %s (new_owner=%s)\n", op_id.c_str(), group_id.c_str(), username.c_str(), new_owner_token.c_str());
+        return;
+    }
+
+    if (opname == "JOIN_AS_OWNER") {
+        string group_id, username;
+        iss >> group_id >> username;
+        if (group_id.empty() || username.empty()) {
+            printf("[sync] malformed JOIN_AS_OWNER op %s, ignoring\n", op_id.c_str());
+            return;
+        }
+        if (!groups.count(group_id)) {
+            printf("[sync] JOIN_AS_OWNER op %s for unknown group '%s', ignoring\n", op_id.c_str(), group_id.c_str());
+            return;
+        }
+        raw_join_as_owner(group_id, username);
+        printf("[sync] applied %s JOIN_AS_OWNER %s %s\n", op_id.c_str(), group_id.c_str(), username.c_str());
         return;
     }
 
