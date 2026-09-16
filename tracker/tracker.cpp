@@ -280,6 +280,36 @@ string handle_command(const string& line, string& current_user) {
     return "ERROR unknown_command";
 }
 
+void handle_client(int client_fd){
+    printf("Client connected.\n");
+        string current_user = "";
+
+    while (true) {
+        string payload;
+        if (!recv_message(client_fd, payload)) {
+            printf("Client disconnected or error.\n");
+            {
+                lock_guard<mutex> lock(g_state_mutex);
+                do_logout(current_user);
+            }
+            break;
+        }
+        printf("Received: %s\n", payload.c_str());
+        string response = handle_command(payload, current_user);
+        printf("Responding %s\n", response.c_str());
+
+        if (!send_message(client_fd, response)) {
+            printf("Failed to send the response\n");
+            {
+                lock_guard<mutex> lock(g_state_mutex);
+                do_logout(current_user);
+            }
+            break;
+        }
+    }
+    close(client_fd);
+}
+
 void apply_sync_op(const string& op_line) {
     istringstream iss(op_line);
     string tag,op_id, opname;
@@ -543,27 +573,8 @@ int main(int argc, char* argv[]) {
             perror("accept failed");
             continue;
         }
-        printf("Client connected.\n");
-        string current_user = "";
-
-        while (true) {
-            string payload;
-            if (!recv_message(client_fd, payload)) {
-                printf("Client disconnected or error.\n");
-                do_logout(current_user);
-                break;
-            }
-            printf("Received: %s\n", payload.c_str());
-            string response = handle_command(payload, current_user);
-            printf("Responding %s\n", response.c_str());
-
-            if (!send_message(client_fd, response)) {
-                printf("Failed to send the response\n");
-                do_logout(current_user);
-                break;
-            }
-        }
-        close(client_fd);
+        thread client_thread(handle_client, client_fd);
+        client_thread.detach();
     }
     close(listen_fd);
     return 0;
