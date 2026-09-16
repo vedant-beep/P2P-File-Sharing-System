@@ -7,10 +7,12 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <csignal>
 
 using namespace std;
 
 int main(int argc, char* argv[]) {
+    signal(SIGPIPE, SIG_IGN);
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <IP>:<PORT>\n", argv[0]);
         return 1;

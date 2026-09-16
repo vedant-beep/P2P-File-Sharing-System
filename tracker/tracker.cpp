@@ -11,6 +11,7 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
+#include <csignal>
 using namespace std;
 
 int g_sync_fd = -1;
@@ -31,10 +32,28 @@ struct TrackerAddr {
     int port;
 };
 
+int g_tracker_no = 0;
+long long g_start_epoch = 0;
+set<string> g_applied_ops;
+vector<string> g_op_log;
+
 map<string, User> users;
 map<string, Group> groups;
 mutex g_state_mutex;
+mutex g_sync_send_mutex; 
 string missing_args = "ERROR missing_arguments";
+
+bool sync_send(const string& line) {
+    lock_guard<mutex> lock(g_sync_send_mutex);
+    if (g_sync_fd < 0) return false;
+    return send_message(g_sync_fd, line);
+}
+
+string next_op_id() {
+    static int counter = 0;
+    counter++;
+    return "T" + to_string(g_tracker_no) + "-" + to_string(g_start_epoch) + "-" + to_string(counter);
+}
 
 void do_logout(string& current_user) {
     if (!current_user.empty()) {
@@ -59,13 +78,18 @@ string check_is_owner(const Group& g, const string& current_user) {
     return "";
 }
 
-void forward_sync_op(const string& op_line) {
+void forward_sync_op(const string& payload) {
+    string op_id = next_op_id();
+    string op_line = "SYNC_OP " + op_id+ " " + payload;
+    g_applied_ops.insert(op_id);
+    g_op_log.push_back(op_line);
+    printf("[sync] op log size now %zu\n", g_op_log.size());
     if (g_sync_fd < 0) {
         printf("[sync] no peer connected, skipping forward: %s\n", op_line.c_str());
         return;
     }
-    if (!send_message(g_sync_fd, op_line)) {
-        printf("[sync] forward failed (peer likely down): %s\n", op_line.c_str());
+    if (!sync_send(op_line)) {
+        printf("[sync] forward failed (peer likely down or not connected): %s\n", op_line.c_str());
     }
 }
 
@@ -113,7 +137,7 @@ string handle_command(const string& line, string& current_user) {
         if (username.empty() || password.empty()) return missing_args;
         if (users.count(username)) return "ERROR user_already_exists";
         raw_create_user(username, password);
-        forward_sync_op("SYNC_OP CREATE_USER " + username + " " + password);
+        forward_sync_op("CREATE_USER " + username + " " + password);
         return "SUCCESS user_created";
     }
 
@@ -148,7 +172,7 @@ string handle_command(const string& line, string& current_user) {
         if (groups.count(group_id)) return "ERROR group_already_exists";
 
         raw_create_group(group_id, current_user);
-        forward_sync_op("SYNC_OP CREATE_GROUP " + group_id + " " + current_user);
+        forward_sync_op("CREATE_GROUP " + group_id + " " + current_user);
         return "SUCCESS group_created";
     }
 
@@ -168,7 +192,7 @@ string handle_command(const string& line, string& current_user) {
         if (g.members.count(current_user)) return "ERROR already_member";
         if (g.pending.count(current_user)) return "ERROR already_pending";
         raw_join_group(group_id, current_user);
-        forward_sync_op("SYNC_OP JOIN_GROUP " + group_id + " " + current_user);
+        forward_sync_op("JOIN_GROUP " + group_id + " " + current_user);
         return "SUCCESS join_requested";
     }
 
@@ -231,7 +255,7 @@ string handle_command(const string& line, string& current_user) {
         if (!g.pending.count(username)) return "ERROR no_such_request";
 
         raw_accept_request(group_id, username);
-        forward_sync_op("SYNC_OP ACCEPT_REQUEST " + group_id + " " + username);
+        forward_sync_op("ACCEPT_REQUEST " + group_id + " " + username);
         return "SUCCESS request_accepted";
     }
 
@@ -249,7 +273,7 @@ string handle_command(const string& line, string& current_user) {
         if (!g.members.count(current_user)) return "ERROR not_a_member";
         if (current_user == g.owner) return "ERROR owner_cannot_leave";
         raw_leave_group(group_id, current_user);
-        forward_sync_op("SYNC_OP LEAVE_GROUP " + group_id + " " + current_user);
+        forward_sync_op("LEAVE_GROUP " + group_id + " " + current_user);
         return "SUCCESS left_group";
     }
 
@@ -258,9 +282,18 @@ string handle_command(const string& line, string& current_user) {
 
 void apply_sync_op(const string& op_line) {
     istringstream iss(op_line);
-    string tag, opname;
-    iss >> tag >> opname;   // tag == "SYNC_OP"
+    string tag,op_id, opname;
+    iss >> tag >>op_id>> opname;   // tag == "SYNC_OP"
 
+    if (g_applied_ops.count(op_id)) {
+        printf("[sync] duplicate op %s, ignoring\n", op_id.c_str());
+        return;
+    }
+
+    g_applied_ops.insert(op_id);
+    g_op_log.push_back(op_line);
+    printf("[sync] op log size now %zu\n", g_op_log.size());
+    
     if (opname == "CREATE_USER") {
         string username, password;
         iss >> username >> password;
@@ -350,10 +383,10 @@ void apply_sync_op(const string& op_line) {
 }
 
 void sync_thread_func(int tracker_no, TrackerAddr self, TrackerAddr peer) {
-    int sync_fd = -1;
+    int sync_listen_fd = -1;
 
     if (tracker_no == 1) {
-        int sync_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        sync_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
         int opt = 1;
         setsockopt(sync_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -364,52 +397,76 @@ void sync_thread_func(int tracker_no, TrackerAddr self, TrackerAddr peer) {
 
         bind(sync_listen_fd, (sockaddr*)&addr, sizeof(addr));
         listen(sync_listen_fd, 1);
-        printf("[sync] Waiting for peer tracker to connect on port %d...\n", self.port + 100);
+    }
 
-        sockaddr_in peer_addr{};
-        socklen_t peer_len = sizeof(peer_addr);
-        sync_fd = accept(sync_listen_fd, (sockaddr*)&peer_addr, &peer_len);
-        printf("[sync] Peer tracker connected.\n");
+    while (true) {
+        int sync_fd = -1;
 
-    } else {
+        if (tracker_no == 1) {
+            printf("[sync] Waiting for peer tracker to connect on port %d...\n", self.port + 100);
+            sockaddr_in peer_addr{};
+            socklen_t peer_len = sizeof(peer_addr);
+            sync_fd = accept(sync_listen_fd, (sockaddr*)&peer_addr, &peer_len);
+            printf("[sync] Peer tracker connected.\n");
+
+        } else {
+            while (true) {
+                sync_fd = socket(AF_INET, SOCK_STREAM, 0);
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(peer.port + 100);
+                inet_pton(AF_INET, peer.ip.c_str(), &addr.sin_addr);
+                if (connect(sync_fd, (sockaddr*)&addr, sizeof(addr)) == 0) {
+                    printf("[sync] Connected to peer tracker.\n");
+                    break;
+                }
+                close(sync_fd);
+                printf("[sync] Peer tracker not up yet, retrying...\n");
+                this_thread::sleep_for(chrono::seconds(1));
+            }
+        }
+
+        g_sync_fd = sync_fd;
+
+        if (tracker_no == 1) {
+            string msg;
+            recv_message(sync_fd, msg);
+            printf("[sync] Received: %s\n", msg.c_str());
+            send_message(sync_fd, "SYNC_ACK");
+        } else {
+            send_message(sync_fd, "SYNC_HELLO");
+            string reply;
+            recv_message(sync_fd, reply);
+            printf("[sync] Received: %s\n", reply.c_str());
+        }
+
+        {
+            vector<string> log_snapshot;
+            {
+                lock_guard<mutex> lock(g_state_mutex);
+                log_snapshot = g_op_log;
+            }
+            printf("[sync] sending catch-up: %zu ops\n", log_snapshot.size());
+            for (const string& op_line : log_snapshot) {
+                sync_send(op_line);
+            }
+        }
+
         while (true) {
-            sync_fd = socket(AF_INET, SOCK_STREAM, 0);
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(peer.port + 100);
-            inet_pton(AF_INET, peer.ip.c_str(), &addr.sin_addr);
-            if (connect(sync_fd, (sockaddr*)&addr, sizeof(addr)) == 0) {
-                printf("[sync] Connected to peer tracker.\n");
+            string msg;
+            if (!recv_message(sync_fd, msg)) {
+                printf("[sync] Peer tracker disconnected.\n");
                 break;
             }
-            close(sync_fd);
-            printf("[sync] Peer tracker not up yet, retrying...\n");
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            printf("[sync] Received: %s\n", msg.c_str());
+            if (msg.rfind("SYNC_OP", 0) == 0) {
+                apply_sync_op(msg);
+            }
         }
-    }
 
-    g_sync_fd = sync_fd;
-    if (tracker_no == 1) {
-        string msg;
-        recv_message(sync_fd, msg);
-        printf("[sync] Received: %s\n", msg.c_str());
-        send_message(sync_fd, "SYNC_ACK");
-    } else {
-        send_message(sync_fd, "SYNC_HELLO");
-        std::string reply;
-        recv_message(sync_fd, reply);
-        printf("[sync] Received: %s\n", reply.c_str());
-    }
-    while (true) {
-        string msg;
-        if (!recv_message(sync_fd, msg)) {
-            printf("[sync] Peer tracker disconnected.\n");
-            break;
-        }
-        printf("[sync] Received: %s\n", msg.c_str());
-        if (msg.rfind("SYNC_OP", 0) == 0) {
-            apply_sync_op(msg);
-        }
+        close(sync_fd);
+        g_sync_fd = -1;
+        printf("[sync] Attempting to re-establish tracker connection...\n");
     }
 }
 
@@ -435,12 +492,15 @@ vector<TrackerAddr> read_tracker_info(const string& path) {
 }
 
 int main(int argc, char* argv[]) {
+    signal(SIGPIPE, SIG_IGN);
     if (argc < 3) {
         fprintf(stderr, "Usage: %s tracker_info.txt tracker_no\n", argv[0]);
         return 1;
     }
     string info_path = argv[1];
     int tracker_no = atoi(argv[2]);   // 1 or 2
+    g_tracker_no = tracker_no;
+    g_start_epoch = chrono::duration_cast<chrono::milliseconds>(chrono::system_clock::now().time_since_epoch()).count();
 
     vector<TrackerAddr> addrs = read_tracker_info(info_path);
     if (tracker_no < 1 || tracker_no > (int)addrs.size()) {
