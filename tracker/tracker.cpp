@@ -69,6 +69,38 @@ void forward_sync_op(const string& op_line) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Raw state mutations. Caller MUST already hold g_state_mutex.
+// No validation, no locking, no forwarding — just the mechanical change.
+// Shared by handle_command (client path) and apply_sync_op (replay path)
+// so the actual mutation logic never has to be written/fixed twice.
+// ---------------------------------------------------------------------
+
+void raw_create_user(const string& username, const string& password) {
+    users[username] = {password, false};
+}
+
+void raw_create_group(const string& group_id, const string& owner) {
+    Group g;
+    g.owner = owner;
+    g.members.insert(owner);
+    groups[group_id] = g;
+}
+
+void raw_join_group(const string& group_id, const string& username) {
+    groups[group_id].pending.insert(username);
+}
+
+void raw_accept_request(const string& group_id, const string& username) {
+    Group& g = groups[group_id];
+    g.pending.erase(username);
+    g.members.insert(username);
+}
+
+void raw_leave_group(const string& group_id, const string& username) {
+    groups[group_id].members.erase(username);
+}
+
 string handle_command(const string& line, string& current_user) {
     lock_guard<mutex> lock(g_state_mutex);
     istringstream iss(line);
@@ -80,7 +112,7 @@ string handle_command(const string& line, string& current_user) {
         iss >> username >> password;
         if (username.empty() || password.empty()) return missing_args;
         if (users.count(username)) return "ERROR user_already_exists";
-        users[username] = {password, false};
+        raw_create_user(username, password);
         forward_sync_op("SYNC_OP CREATE_USER " + username + " " + password);
         return "SUCCESS user_created";
     }
@@ -115,10 +147,8 @@ string handle_command(const string& line, string& current_user) {
 
         if (groups.count(group_id)) return "ERROR group_already_exists";
 
-        Group g;
-        g.owner = current_user;
-        g.members.insert(current_user);
-        groups[group_id] = g;
+        raw_create_group(group_id, current_user);
+        forward_sync_op("SYNC_OP CREATE_GROUP " + group_id + " " + current_user);
         return "SUCCESS group_created";
     }
 
@@ -137,7 +167,8 @@ string handle_command(const string& line, string& current_user) {
         Group& g = it->second;
         if (g.members.count(current_user)) return "ERROR already_member";
         if (g.pending.count(current_user)) return "ERROR already_pending";
-        g.pending.insert(current_user);
+        raw_join_group(group_id, current_user);
+        forward_sync_op("SYNC_OP JOIN_GROUP " + group_id + " " + current_user);
         return "SUCCESS join_requested";
     }
 
@@ -199,8 +230,8 @@ string handle_command(const string& line, string& current_user) {
 
         if (!g.pending.count(username)) return "ERROR no_such_request";
 
-        g.pending.erase(username);
-        g.members.insert(username);
+        raw_accept_request(group_id, username);
+        forward_sync_op("SYNC_OP ACCEPT_REQUEST " + group_id + " " + username);
         return "SUCCESS request_accepted";
     }
 
@@ -217,7 +248,8 @@ string handle_command(const string& line, string& current_user) {
         Group& g = it->second;
         if (!g.members.count(current_user)) return "ERROR not_a_member";
         if (current_user == g.owner) return "ERROR owner_cannot_leave";
-        g.members.erase(current_user);
+        raw_leave_group(group_id, current_user);
+        forward_sync_op("SYNC_OP LEAVE_GROUP " + group_id + " " + current_user);
         return "SUCCESS left_group";
     }
 
@@ -236,20 +268,86 @@ void apply_sync_op(const string& op_line) {
             printf("[sync] malformed CREATE_USER op, ignoring\n");
             return;
         }
-
         lock_guard<mutex> lock(g_state_mutex);
         if (users.count(username)) {
             printf("[sync] user '%s' already exists locally, skipping\n", username.c_str());
             return;
         }
-        users[username] = {password, false};
+        raw_create_user(username, password);
         printf("[sync] applied CREATE_USER %s\n", username.c_str());
+        return;
+    }
+
+    if (opname == "CREATE_GROUP") {
+        string group_id, owner;
+        iss >> group_id >> owner;
+        if (group_id.empty() || owner.empty()) {
+            printf("[sync] malformed CREATE_GROUP op, ignoring\n");
+            return;
+        }
+        lock_guard<mutex> lock(g_state_mutex);
+        if (groups.count(group_id)) {
+            printf("[sync] group '%s' already exists locally, skipping\n", group_id.c_str());
+            return;
+        }
+        raw_create_group(group_id, owner);
+        printf("[sync] applied CREATE_GROUP %s owner=%s\n", group_id.c_str(), owner.c_str());
+        return;
+    }
+
+    if (opname == "JOIN_GROUP") {
+        string group_id, username;
+        iss >> group_id >> username;
+        if (group_id.empty() || username.empty()) {
+            printf("[sync] malformed JOIN_GROUP op, ignoring\n");
+            return;
+        }
+        lock_guard<mutex> lock(g_state_mutex);
+        if (!groups.count(group_id)) {
+            printf("[sync] JOIN_GROUP for unknown group '%s', ignoring\n", group_id.c_str());
+            return;
+        }
+        raw_join_group(group_id, username);
+        printf("[sync] applied JOIN_GROUP %s %s\n", group_id.c_str(), username.c_str());
+        return;
+    }
+
+    if (opname == "ACCEPT_REQUEST") {
+        string group_id, username;
+        iss >> group_id >> username;
+        if (group_id.empty() || username.empty()) {
+            printf("[sync] malformed ACCEPT_REQUEST op, ignoring\n");
+            return;
+        }
+        lock_guard<mutex> lock(g_state_mutex);
+        if (!groups.count(group_id)) {
+            printf("[sync] ACCEPT_REQUEST for unknown group '%s', ignoring\n", group_id.c_str());
+            return;
+        }
+        raw_accept_request(group_id, username);
+        printf("[sync] applied ACCEPT_REQUEST %s %s\n", group_id.c_str(), username.c_str());
+        return;
+    }
+
+    if (opname == "LEAVE_GROUP") {
+        string group_id, username;
+        iss >> group_id >> username;
+        if (group_id.empty() || username.empty()) {
+            printf("[sync] malformed LEAVE_GROUP op, ignoring\n");
+            return;
+        }
+        lock_guard<mutex> lock(g_state_mutex);
+        if (!groups.count(group_id)) {
+            printf("[sync] LEAVE_GROUP for unknown group '%s', ignoring\n", group_id.c_str());
+            return;
+        }
+        raw_leave_group(group_id, username);
+        printf("[sync] applied LEAVE_GROUP %s %s\n", group_id.c_str(), username.c_str());
         return;
     }
 
     printf("[sync] unknown sync op: %s\n", opname.c_str());
 }
-
 
 void sync_thread_func(int tracker_no, TrackerAddr self, TrackerAddr peer) {
     int sync_fd = -1;
@@ -335,6 +433,7 @@ vector<TrackerAddr> read_tracker_info(const string& path) {
     }
     return addrs;
 }
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s tracker_info.txt tracker_no\n", argv[0]);
